@@ -1,27 +1,27 @@
 /*
-    Color-Isolated Soft Anamorphic Bloom (Double Width Version)
+    Color-Isolated Soft Anamorphic Bloom (Double Width + Depth Falloff)
     Author: al_chan-Gemini Thinking 3.0 assisted
     Description: 
        - Multiplied horizontal spread factor by 2x for massive anamorphic streaks.
        - Integrated Color Isolation detection.
        - Smooth Gaussian blur with no blocky artifacts.
-	   - High-intensity anamorphic streaks masked by depth. 
-       - Includes Debug Mode to verify depth input.
+	   - High-intensity anamorphic streaks masked by depth.
        - Fixed X3511/X3570 errors using tex2Dlod.
 	   - Generates intense horizontal streaks.
        - Occludes flares behind objects (Depth Masking).
        - FILTERS flares based on distance (Min Depth Check).
-	   - Generates high-resolution, smooth OVAL-shaped streaks.
+       - Generates high-resolution, smooth OVAL-shaped streaks.
        - Solves blocky artifacts from low-res game lights.
        - Includes Depth Occlusion and Distance Filtering.
 	   - Two-pass anamorphic bloom.
        - Includes Depth Occlusion and distance filtering.
        - NEW: Added forced smooth attenuation at the ends of the horizontal blur to prevent hard edges.
-	   - Triggers flares based on COLOR MATCHING + Brightness.
+       - NEW: Added Depth Falloff for smooth fading near the camera.
+       - Triggers flares based on COLOR MATCHING + Brightness.
        - Uses the Hybrid "Oval" shape with soft vertical blur.
        - Includes Depth Occlusion and Distance Filtering.
     License: CC0 (Public Domain)
-	Credits :: J.J Abrams Lens Flare, Gemini Thinking 3.0
+	Credits :: J.J Abrams Lens Flare, Gemini
 */
 
 #include "ReShade.fxh"
@@ -62,6 +62,7 @@ uniform float fBloomThreshold <
     ui_min = 0.0; ui_max = 1.0;
     ui_step = 0.01;
 > = 0.60;
+
 // -----------------------
 
 uniform float fBloomIntensity <
@@ -91,7 +92,8 @@ uniform float fBlurHeightScale <
     ui_category = "Shape & Size";
     ui_label = "Blur Height (Softness)";
     ui_type = "slider";
-    ui_min = 0.1; ui_max = 5.0;
+    ui_min = 0.1; 
+    ui_max = 10.0; // UPDATED: Changed from 5.0 to 10.0
     ui_step = 0.1;
 > = 1.5;
 
@@ -99,7 +101,8 @@ uniform float fBloomGamma <
     ui_category = "Appearance";
     ui_label = "Intensity Curve";
     ui_type = "slider";
-    ui_min = 1.0; ui_max = 5.0;
+    ui_min = 1.0;
+    ui_max = 5.0;
     ui_step = 0.1;
 > = 2.5;
 
@@ -109,7 +112,17 @@ uniform float fFlareMinDepth <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 1.0;
     ui_step = 0.001;
-> = 0.0; 
+> = 0.0;
+
+// NEW: Depth Falloff Slider
+uniform float fFlareDepthFalloff <
+    ui_category = "Distance / Occlusion";
+    ui_label = "Min Distance Falloff";
+    ui_tooltip = "Controls how smoothly the flare fades out as it gets close to the camera. 0 = Hard Cut.";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 0.5;
+    ui_step = 0.001;
+> = 0.05;
 
 uniform float fDepthOcclusionStrength <
     ui_category = "Distance / Occlusion";
@@ -132,7 +145,8 @@ uniform int iBlurSamples <
     ui_label = "Blur Samples";
     ui_tooltip = "If you see dots because of the extra width, increase this number.";
     ui_type = "slider";
-    ui_min = 16; ui_max = 128;
+    ui_min = 16;
+    ui_max = 128;
     ui_step = 2;
 > = 64;
 
@@ -158,7 +172,6 @@ float3 PS_HorizontalBlur(float4 vpos : SV_Position, float2 texcoord : TexCoord) 
     for (int i = -iBlurSamples; i <= iBlurSamples; i++)
     {
         float offset = float(i);
-        
         float gaussWeight = GetGaussianWeight(offset, sigma);
         float normalizedDist = abs(offset) / maxOffset;
         float edgeFade = pow(1.0 - normalizedDist, 2.0);
@@ -166,15 +179,19 @@ float3 PS_HorizontalBlur(float4 vpos : SV_Position, float2 texcoord : TexCoord) 
 
         if (finalWeight <= 0.0) continue;
 
-        // --- CHANGE: Multiplied by 4.0 instead of 2.0 ---
         // This doubles the distance between samples, making the flare twice as long.
         float2 sampleUV = texcoord + float2(offset * pixelSize.x * 4.0, 0.0);
         
         if (sampleUV.x < 0.0 || sampleUV.x > 1.0) continue;
-        
-        // Distance Check
+
+        // --- UPDATED: Smooth Depth Filtering ---
         float sourceDepth = ReShade::GetLinearizedDepth(sampleUV);
-        if (sourceDepth < fFlareMinDepth) continue;
+        
+        // Calculate smooth fade factor
+        // If depth < Min, factor is 0. If depth > Min + Falloff, factor is 1.
+        float distanceMask = smoothstep(fFlareMinDepth, fFlareMinDepth + max(0.0001, fFlareDepthFalloff), sourceDepth);
+        
+        if (distanceMask <= 0.0) continue;
 
         // Sample Source Color
         float3 sourceColor = tex2Dlod(ReShade::BackBuffer, float4(sampleUV, 0.0, 0.0)).rgb;
@@ -189,7 +206,7 @@ float3 PS_HorizontalBlur(float4 vpos : SV_Position, float2 texcoord : TexCoord) 
         float combinedStrength = brightnessFactor * colorMatch;
 
         if (combinedStrength <= 0.0001) continue;
-        
+
         combinedStrength = pow(combinedStrength, fBloomGamma);
 
         // Occlusion
@@ -197,7 +214,8 @@ float3 PS_HorizontalBlur(float4 vpos : SV_Position, float2 texcoord : TexCoord) 
         float occlusionMask = smoothstep(-fDepthTolerance, fDepthTolerance*2.0, depthDiff); 
         occlusionMask = lerp(1.0, occlusionMask, fDepthOcclusionStrength);
 
-        accumulatedColor += combinedStrength * finalWeight * occlusionMask;
+        // Combine all masks: Weight * Occlusion * DistanceFade
+        accumulatedColor += combinedStrength * finalWeight * occlusionMask * distanceMask;
         totalWeight += finalWeight;
     }
 
@@ -208,7 +226,6 @@ float3 PS_HorizontalBlur(float4 vpos : SV_Position, float2 texcoord : TexCoord) 
 float3 PS_VerticalCombine(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
     float3 originalColor = tex2D(ReShade::BackBuffer, texcoord).rgb;
-    
     float3 accumulatedBloom = 0.0;
     float totalWeight = 0.0;
     float2 pixelSize = ReShade::PixelSize;
@@ -222,6 +239,7 @@ float3 PS_VerticalCombine(float4 vpos : SV_Position, float2 texcoord : TexCoord)
         float weight = GetGaussianWeight(offset, sigma);
 
         float2 sampleUV = texcoord + float2(0.0, offset * pixelSize.y * 2.0);
+
         if (sampleUV.y < 0.0 || sampleUV.y > 1.0) continue;
         
         accumulatedBloom += tex2Dlod(SamplerBlurH, float4(sampleUV, 0.0, 0.0)).rgb * weight;
@@ -255,5 +273,4 @@ technique ColorIsolatedSoftBloom
         VertexShader = PostProcessVS;
         PixelShader = PS_VerticalCombine;
     }
-
 }
