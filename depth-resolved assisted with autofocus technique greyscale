@@ -1,0 +1,409 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Greyscale Depth Pixel (Greyscale_Depth_Pixel.fx)
+// Merged from SirCobra's Greyscale.fx and ColorIsolation2 logic
+//
+// --------Description---------
+// This shader applies a high-quality Greyscale conversion masked by depth.
+// UPDATED: All controls now use RAW DEPTH units (0.0 to 1.0) instead of Meters.
+// 0.0 = Camera Near Plane (Close)
+// 1.0 = Camera Far Plane (Horizon)
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include "Reshade.fxh"
+
+// Namespace Everything!
+namespace COBRA_GSC_DEPTH
+{
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //                                            Defines & UI
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    #define COBRA_GSC_VERSION "0.1.0_PixelMod"
+    #define COBRA_UTL_MODE 0
+    #include ".\CobraUtility.fxh"
+
+    #if (COBRA_UTL_VERSION_NUMBER < 1030)
+        #error "CobraUtility.fxh outdated! Please update CobraFX!"
+    #endif
+
+    // --- GREYSCALE CONTROLS ---
+    
+    uniform int UI_EffectType <
+        ui_label     = " Greyscale Metric";
+        ui_type      = "radio";
+        ui_spacing   = 2;
+        ui_items     = "Linear Average\0Luma\0CIE XYZ Relative Luminance Y\0Oklab Perceived Lightness L\0";
+        ui_tooltip   = "The type of greyscale conversion.";
+        ui_category  = "Greyscale Settings";
+    > = 3;
+
+    uniform float UI_EffectStrength <
+        ui_label     = " Global Strength";
+        ui_type      = "slider";
+        ui_min       = 0.000;
+        ui_max       = 1.000;
+        ui_step      = 0.001;
+        ui_tooltip   = "The maximum strength of the conversion (multiplied by depth mask).";
+        ui_category  = "Greyscale Settings";
+    > = 1.000;
+
+    // --- DEPTH & MASK CONTROLS ---
+
+    #define CATEGORY_DEPTH "Depth Masking (Background)"
+
+    uniform float fDepthStart <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Depth Start";
+        ui_type = "slider";
+        ui_min = 0.0; ui_max = 1.0;
+        ui_step = 0.001;
+        ui_tooltip = "Distance at which the effect starts to appear (0.0 = camera).";
+    > = 0.0;
+
+    uniform float fDepthGamma <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Depth Reading Gamma";
+        ui_type = "slider";
+        ui_min = 0.001; ui_max = 5.0;
+        ui_step = 0.001;
+        ui_tooltip = "Controls the mid-tone distribution of the depth buffer.\n1.0 = Linear.\nLower = Expands near depth.\nHigher = Expands far depth.";
+    > = 1.0;
+
+    uniform float fDepthEnd <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Depth End";
+        ui_type = "slider";
+        ui_min = 0.0;
+        ui_max = 1.0;
+        ui_step = 0.001;
+        ui_tooltip = "Distance at which the effect is at its fullest.";
+    > = 0.1;
+
+    uniform float fDepthFalloff <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Depth Falloff";
+        ui_type = "slider";
+        ui_min = 0.0;
+        ui_max = 1.0;
+        ui_step = 0.001;
+        ui_tooltip = "Distance over which the effect fades out after 'Depth End'.";
+    > = 0.1;
+
+    uniform int iDepthStartSteps <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Depth Start Steps";
+        ui_type = "slider";
+        ui_min = 1; ui_max = 10000;
+    > = 1000;
+
+    uniform int iDepthEndSteps <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Depth End Steps";
+        ui_type = "slider";
+        ui_min = 1; ui_max = 10000;
+    > = 1000;
+
+    uniform int iDepthFalloffSteps <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Depth Falloff Steps";
+        ui_type = "slider";
+        ui_min = 1; ui_max = 10000;
+    > = 1000;
+
+    uniform bool bDebugDepth <
+        ui_type = "checkbox";
+        ui_label = "Show Depth Buffer";
+        ui_category = CATEGORY_DEPTH;
+        ui_tooltip = "Displays the linearized, gamma-corrected depth buffer in grayscale for debugging.";
+    > = false;
+
+    uniform bool bDepthSmooth <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Enable Depth Smoothing";
+    > = true;
+
+    uniform int iDepthSmoothRadius <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Depth Smooth Radius";
+        ui_type = "slider";
+        ui_min = 0; ui_max = 4;
+    > = 1;
+
+    uniform bool bDepthBilateral <
+        ui_category = CATEGORY_DEPTH;
+        ui_label = "Bilateral Smoothing";
+    > = true;
+
+    // --- FOCUS & EXCLUDE CONTROLS ---
+    
+    #define CATEGORY_EXCLUDE "Foreground Protection"
+
+    uniform bool bExcludeFocus <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Exclude Focus Band";
+        ui_tooltip = "Excludes pixels within the Focus Range of the Focus Depth.";
+    > = false;
+
+    // NEW: Foreground Protection
+    uniform bool bExcludeForeground <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Exclude Foreground (Protect Character)";
+        ui_tooltip = "Excludes everything CLOSER than the focus depth.\nUse this to keep your character in color while making the background grey.";
+    > = true;
+
+    uniform float fFocusDepth <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Focus Depth (0-1)";
+        ui_type = "slider"; 
+        ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
+        ui_tooltip = "The exact depth of your subject.\nUse Auto-Focus to set this automatically.";
+    > = 0.050; // Default to close-ish
+
+    uniform float fFocusRangeDepth <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Focus Band Width (0-1)";
+        ui_type = "slider"; 
+        ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
+        ui_tooltip = "How thick the protected band is (for Exclude Focus).";
+    > = 0.020;
+
+    // RAW DEPTH FOREGROUND CONTROLS
+    uniform float fForegroundDepthOffset <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Protection Offset (0-1)";
+        ui_tooltip = "Pushes protection behind the subject (Positive) or pulls it in front (Negative).";
+        ui_type = "slider";
+        ui_min = -0.1; ui_max = 0.1; ui_step = 0.0001;
+    > = 0.005;
+
+    uniform float fForegroundDepthFalloff <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Protection Falloff (0-1)";
+        ui_tooltip = "Fade length in raw depth units.";
+        ui_type = "slider";
+        ui_min = 0.0; ui_max = 0.2; ui_step = 0.0001;
+    > = 0.010;
+
+    uniform int iForegroundSteps <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Protection Falloff Steps";
+        ui_type = "slider";
+        ui_tooltip = "Quantization steps for the foreground falloff (higher = smoother, lower = banded).";
+        ui_min = 1; ui_max = 10000;
+    > = 1000;
+
+    uniform float fExcludeStrength <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Exclude Strength";
+        ui_type = "slider";
+        ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    > = 1.0;
+
+    uniform bool bUseAutoFocus <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Use Auto-Focus Point";
+    > = true;
+
+    uniform float2 AutoFocusUV <
+        ui_category = CATEGORY_EXCLUDE;
+        ui_label = "Auto-Focus UV";
+        ui_type = "slider";
+        ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    > = float2(0.5, 0.5);
+
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //                                           Helper Functions
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    #define COBRA_UTL_MODE 2
+    #include ".\CobraUtility.fxh"
+
+    // --- DEPTH HELPERS ---
+
+    float SampleLinearDepth(float2 tc) {
+        return ReShade::GetLinearizedDepth(tc);
+    }
+
+    float SmoothDepth(float2 tc, int radius) {
+        if (radius <= 0 || !bDepthSmooth) return SampleLinearDepth(tc);
+        float2 px = 1.0 / ReShade::ScreenSize;
+        float sum = 0.0;
+        float wsum = 0.0;
+        float centerDepth = SampleLinearDepth(tc);
+        float3 centerColor = tex2D(ReShade::BackBuffer, tc).rgb;
+
+        for (int y = -radius; y <= radius; ++y) {
+            for (int x = -radius; x <= radius; ++x) {
+                float2 off = float2(x, y) * px;
+                float d = SampleLinearDepth(tc + off);
+                float dist = length(float2(x, y));
+                float w = exp(-dist * 0.8);
+
+                if (bDepthBilateral) {
+                    float3 c = tex2D(ReShade::BackBuffer, tc + off).rgb;
+                    float cd = length(c - centerColor);
+                    w *= exp(-cd * 10.0);
+                }
+                sum += d * w;
+                wsum += w;
+            }
+        }
+        return wsum > 0.0 ? sum / wsum : centerDepth;
+    }
+
+    float Quantize(float v, int steps) {
+        int s = max(1, steps);
+        return round(v * (float)s) / (float)s;
+    }
+
+    float PreciseDepthMask(float depth, float start, float end, float falloff, int sSteps, int eSteps, int fSteps) {
+        float sQ = Quantize(start, sSteps);
+        float eQ = Quantize(end, eSteps);
+        float fQ = Quantize(falloff, fSteps);
+        if (eQ < sQ) eQ = sQ;
+        float mask = smoothstep(sQ, eQ, depth) * (1.0 - smoothstep(eQ, eQ + fQ, depth));
+        return saturate(mask);
+    }
+
+    // UPDATED: Simple Range check (Pixel Depth)
+    float ComputeFocalMask(float linearDepth, float focusDepth) {
+        if (!bExcludeFocus) return 0.0;
+        
+        // Simple Absolute Distance check
+        float dist = abs(linearDepth - focusDepth);
+        
+        // Normalize by range (0.0 at focus, 1.0 at edge of range)
+        float range = max(0.0001, fFocusRangeDepth);
+        float val = dist / range;
+        
+        // Invert: 1.0 at center, 0.0 outside
+        float mask = saturate(1.0 - val);
+        
+        // Smooth edges slightly
+        return smoothstep(0.0, 1.0, mask);
+    }
+
+    // UPDATED: Simple Threshold check (Pixel Depth)
+    float ComputeForegroundMask(float linearDepth, float focusDepth) {
+        if (!bExcludeForeground) return 0.0;
+        
+        // 1. Calculate Cutoff
+        float protectionEnd = focusDepth + fForegroundDepthOffset;
+        
+        // 2. Quantize Falloff (just like the depth mask)
+        float falloff = Quantize(fForegroundDepthFalloff, iForegroundSteps);
+        
+        // 3. Compute Mask (Inverted smoothstep: 1.0 near -> 0.0 far)
+        // If falloff is 0, we use a small epsilon to avoid NaN
+        float mask = 1.0 - smoothstep(protectionEnd, protectionEnd + max(0.001, falloff), linearDepth);
+        
+        return saturate(mask);
+    }
+
+    float ComputeExcludeMask(float2 texcoord, float linearDepth) {
+        float focusDepth = fFocusDepth;
+        if (bUseAutoFocus) {
+            float sampled = SmoothDepth(AutoFocusUV, max(0, iDepthSmoothRadius));
+            // Direct depth sample (0-1)
+            focusDepth = sampled;
+        }
+
+        float focal = ComputeFocalMask(linearDepth, focusDepth);
+        
+        // UPDATED: Use the new Slider-based Foreground Mask
+        float foreground = ComputeForegroundMask(linearDepth, focusDepth);
+        
+        // Combine exclusions (max)
+        float mask = max(focal, foreground);
+
+        return saturate(mask * fExcludeStrength);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //                                         Shaders
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    vs2ps VS_Greyscale(uint id : SV_VertexID) 
+    {
+        return vs_basic(id, float2(0.0, 0.0));
+    }
+
+    void PS_Greyscale(vs2ps o, out float4 fragment : SV_Target)
+    {   
+        // 1. Prepare Depth Data
+        float smooth_depth = SmoothDepth(o.vpos.xy / ReShade::ScreenSize, iDepthSmoothRadius);
+        
+        // Debug output
+        if (bDebugDepth) {
+            float depth_vis = pow(max(0.0, smooth_depth), fDepthGamma);
+            fragment = float4(depth_vis.xxx, 1.0);
+            return;
+        }
+
+        // 2. Calculate Depth Mask (The band where Greyscale happens)
+        float depth_for_isolation = pow(max(0.0, smooth_depth), fDepthGamma);
+        float depth_factor = PreciseDepthMask(depth_for_isolation, fDepthStart, fDepthEnd, fDepthFalloff, iDepthStartSteps, iDepthEndSteps, iDepthFalloffSteps);
+        
+        // 3. Calculate Exclusions (The areas we want to PROTECT/KEEP COLOR)
+        // Now includes "Foreground Protection" based on AutoFocus + Manual Sliders
+        float excludeMask = ComputeExcludeMask(o.vpos.xy / ReShade::ScreenSize, smooth_depth);
+        
+        // 4. Combine
+        // If excludeMask is 1.0 (Foreground), final_mask becomes 0.0 (No Grey).
+        float final_mask = depth_factor * (1.0 - excludeMask);
+        
+        // Apply global strength to the mask
+        float current_strength = UI_EffectStrength * final_mask;
+
+        // --- GREYSCALE LOGIC (Original CobraFX) ---
+        float4 enc   = tex2Dfetch(ReShade::BackBuffer, floor(o.vpos.xy));
+        float3 lrgb  = enc_to_lin(enc.rgb);
+
+        // Linear Average 0
+        float3 lin_avg   = dot(lrgb, 1.0 / 3.0).xxx;
+        lin_avg          = lerp(lrgb, lin_avg, current_strength);
+        
+        // Luma 1
+        float3 luma      = csp_to_luminance(enc.xyz).xxx;
+        luma             = lerp(enc.rgb, luma, current_strength);
+        
+        // CIE XYZ Relative Luminance Y 2
+        float3 y                 = csp_to_xyz(lrgb);
+        const float3 W_D65_XYZ   = float3(0.95047, 1.000, 1.08883);
+        y                        = xyz_to_csp(lerp(y, W_D65_XYZ * y.y, current_strength));
+        
+        // Oklab Perceived Lightness 3
+        float3 oklab     = csp_to_oklab(lrgb);
+        oklab.yz         = lerp(oklab.yz, 0.0, current_strength);
+        oklab            = oklab_to_csp(oklab);
+        
+        // Result
+        enc.xyz    = UI_EffectType == 1 ?
+        luma : lin_to_enc(lin_avg);
+        enc.xyz    = UI_EffectType == 2 ? lin_to_enc(y) : enc.xyz;
+        enc.xyz    = UI_EffectType == 3 ? lin_to_enc(oklab): enc.xyz;
+        
+        fragment = enc; // preserves alpha!
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //                                             Techniques
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    technique TECH_GreyscaleDepth <
+        ui_label     = "Greyscale (Depth Aware)";
+        ui_tooltip   = "Greyscale with Depth Masking.\n"
+                       "Features:\n"
+                       "- Band-pass depth isolation (Start/End)\n"
+                       "- Foreground Protection with precise Offset/Falloff sliders (Raw Pixel Depth)";
+    >
+    {
+        pass Greyscale
+        {
+            VertexShader = VS_Greyscale;
+            PixelShader  = PS_Greyscale;
+        }
+    }
+}
