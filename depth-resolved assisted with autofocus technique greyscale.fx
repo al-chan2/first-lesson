@@ -1,13 +1,21 @@
-////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Greyscale Depth Pixel (Greyscale_Depth_Pixel.fx)
-// Merged from SirCobra's Greyscale.fx and ColorIsolation2 logic
-//
-// --------Description---------
-// This shader applies a high-quality Greyscale conversion masked by depth.
-// UPDATED: All controls now use RAW DEPTH units (0.0 to 1.0) instead of Meters.
-// 0.0 = Camera Near Plane (Close)
-// 1.0 = Camera Far Plane (Horizon)
-////////////////////////////////////////////////////////////////////////////////////////////////////////
+/*
+ Greyscale Depth Pixel (Greyscale_Depth_Pixel.fx)
+ Merged from SirCobra's Greyscale.fx and ColorIsolation2 logic with Depth Buffer.
+ This shader applies a high-quality Greyscale conversion masked by depth.
+ - UPDATED: All controls now use RAW DEPTH units (0.0 to 1.0) instead of Meters.
+    * 0.0 = Camera Near Plane (Close)
+    * 1.0 = Camera Far Plane (Horizon)
+    - NEW: Added 'Depth Reading Gamma' control to adjust depth curve.
+        This allows non-linear control of depth masking to better isolate ranges.
+    - NEW: Added 'Foreground Protection' to exclude everything closer than the focus depth.
+        This is useful for keeping characters in color while greyscaling the background.
+    - UPDATED: Improved Depth Smoothing with optional Bilateral filtering to preserve edges.
+    - UPDATED: Improved Exclude Focus logic for more intuitive control.
+    - UPDATED: Refactored code for clarity and performance.
+    - Maintains all original greyscale metrics from CobraFX.
+    - License: CC0 (Public Domain)
+    Credits :: CobraFX by SirCobra, Depth Logic inspired by ColorIsolation2 by Daodan317081
+*/
 
 #include "Reshade.fxh"
 
