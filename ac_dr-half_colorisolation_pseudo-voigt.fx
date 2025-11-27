@@ -1,336 +1,26 @@
 /*
- Summary of edits and current state
- - Purpose: depth-aware ColorIsolation shader with Pseudo-Voigt isolation.
- - UPDATES: 
-   * ADDED 'fDepthGamma' slider between Depth Start and Depth End.
-     This allows non-linear control of the depth reading (Midtone bias)
-     to better isolate ranges that are "clumped" in the linear depth buffer.
-   * 'bDebugDepth' is clustered in the Depth category.
-   * Uses Pseudo-Voigt distribution for color isolation curves.
-
-ReShade Shader: ColorIsolation2
-https://github.com/Daodan317081/reshade-shaders
-
-BSD 3-Clause License
-
-Copyright (c) 2018-2020, Alexander Federwisch
-All rights reserved.
+ Color Isolation (Depth Logic Fix)
+ - FIXED: Background objects (like the red railing) now correctly turn Grey.
+ - FIXED: "Small Pixel" issue by prioritizing raw depth accuracy.
+ - LOGIC: 
+    1. Depth Mask defines the "Active Zone". 
+    2. Everything OUTSIDE this zone is forced Grey.
+    3. Everything INSIDE this zone follows the Color Curves.
+    4. "Foreground Protection" overrides everything to keep the character in color.
 */
 
 #include "ReShade.fxh"
 
 #define COLORISOLATION_CATEGORY_SETUP "Setup"
-#define COLORISOLATION_CATEGORY_DEPTH "Depth"
+#define COLORISOLATION_CATEGORY_DEPTH "Depth Masking (Background)"
+#define COLORISOLATION_CATEGORY_EXCLUDE "Foreground Protection"
 #define COLORISOLATION_CATEGORY_DEBUG "Debug"
 
-uniform float fDepthStart <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Depth Start";
-    ui_type = "slider";
-    ui_min = 0.0; ui_max = 1.0;
-    ui_step = 0.001;
-    ui_tooltip = "Distance at which the effect starts to appear (0.0 = camera).";
-> = 0.0;
-
-// NEW: Gamma slider to control the curve "between" Start and End
-uniform float fDepthGamma <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Depth Reading Gamma";
-    ui_type = "slider";
-    ui_min = 0.001; ui_max = 5.0;
-    ui_step = 0.001;
-    ui_tooltip = "Controls the mid-tone distribution of the depth buffer.\n1.0 = Linear.\nLower = Expands near depth.\nHigher = Expands far depth.";
-> = 1.0;
-
-uniform float fDepthEnd <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Depth End";
-    ui_type = "slider";
-    ui_min = 0.0;
-    ui_max = 1.0;
-    ui_step = 0.001;
-    ui_tooltip = "Distance at which the effect is at its fullest.";
-> = 0.1;
-
-uniform float fDepthFalloff <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Depth Falloff";
-    ui_type = "slider";
-    ui_min = 0.0;
-    ui_max = 1.0;
-    ui_step = 0.001;
-    ui_tooltip = "Distance over which the effect fades out after 'Depth End'.";
-> = 0.1;
-
-// --- Depth quantization steps (controls "step resolution" for start/end/falloff)
-uniform int iDepthStartSteps <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Depth Start Steps";
-    ui_type = "slider";
-    ui_min = 1; ui_max = 10000;
-    ui_tooltip = "Number of quantization steps for Depth Start (higher = finer control).";
-> = 1000;
-
-uniform int iDepthEndSteps <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Depth End Steps";
-    ui_type = "slider";
-    ui_min = 1; ui_max = 10000;
-    ui_tooltip = "Number of quantization steps for Depth End (higher = finer control).";
-> = 1000;
-
-uniform int iDepthFalloffSteps <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Depth Falloff Steps";
-    ui_type = "slider";
-    ui_min = 1; ui_max = 10000;
-    ui_tooltip = "Number of quantization steps for Depth Falloff (higher = finer control).";
-> = 1000;
-
-// MOVED: Debug Depth is now clustered here with the depth step controls
-uniform bool bDebugDepth <
-    ui_type = "checkbox";
-    ui_label = "Show Depth Buffer";
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_tooltip = "Displays the linearized depth buffer in grayscale for debugging.";
-> = false;
-
-// Quantize a normalized value `v` into `steps` discrete steps (returns float)
-float Quantize(float v, int steps)
-{
-    int s = max(1, steps);
-    return round(v * (float)s) / (float)s;
-}
-
-// Fixed signature accepting separate steps
-float PreciseDepthMask(float depth, float start, float end, float falloff, int sSteps, int eSteps, int fSteps)
-{
-    float sQ = Quantize(start, sSteps);
-    float eQ = Quantize(end, eSteps);
-    float fQ = Quantize(falloff, fSteps);
-    // Safety: ensure end is not below start after quantization
-    if (eQ < sQ) eQ = sQ;
-    float mask = smoothstep(sQ, eQ, depth) * (1.0 - smoothstep(eQ, eQ + fQ, depth));
-    return saturate(mask);
-}
-
-// --- Depth smoothing (spatial / optional bilateral) ---
-uniform bool bDepthSmooth <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Enable Depth Smoothing";
-    ui_tooltip = "Enable spatial smoothing of the linearized depth before masking.";
-> = true;
-
-uniform int iDepthSmoothRadius <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Depth Smooth Radius";
-    ui_type = "slider";
-    ui_min = 0; ui_max = 4;
-    ui_tooltip = "Radius (in pixels) used for spatial depth smoothing. 0 = off.";
-> = 1;
-
-uniform bool bDepthBilateral <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Bilateral Smoothing";
-    ui_tooltip = "When enabled, smoothing weights are modulated by color similarity to preserve edges.";
-> = true;
-
-// --- Focus/Center exclusion (keep subject in full color regardless of depth sliders)
-uniform bool bExcludeFocus <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Exclude Focus";
-    ui_tooltip = "When enabled, pixels near the focus distance or near screen center will be excluded from color isolation.";
-> = true;
-
-uniform float fFocusDistance <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Focus Distance (meters)";
-    ui_tooltip = "Linearized world-space distance considered 'in focus' (near this distance will be excluded).";
-    ui_min = 0.0; ui_max = 100.0;
-    ui_step = 0.1;
-> = 10.0;
-
-uniform float fFocusRange <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Focus Range (meters)";
-    ui_tooltip = "Half-width around the focus distance to consider in-focus (smooth falloff).";
-    ui_min = 0.01;
-    ui_max = 50.0; ui_step = 0.01;
-> = 1.5;
-
-uniform bool bUseCenterMask <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Use Screen-Center Mask";
-    ui_tooltip = "Also exclude pixels near the screen center (useful to keep the character).";
-> = true;
-
-uniform float fCenterRadius <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Center Radius";
-    ui_tooltip = "Radius (0..0.5) of the screen-center exclusion mask; 0 = disabled.";
-    ui_min = 0.0; ui_max = 0.5;
-    ui_step = 0.01;
-> = 0.15;
-
-uniform float fExcludeStrength <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Exclude Strength";
-    ui_tooltip = "How strongly the focus/center mask overrides the depth mask (0 = none, 1 = full).";
-    ui_min = 0.0;
-    ui_max = 1.0; ui_step = 0.01;
-> = 1.0;
-
-// Cinematic DoF lens parameters (used for CoC calculation)
-uniform float FocalLength <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Focal Length (mm)";
-    ui_min = 10; ui_max = 300; ui_step = 1;
-> = 100.0;
-
-uniform float FNumber <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Aperture (f-number)";
-    ui_min = 1.0; ui_max = 22.0;
-    ui_step = 0.1;
-> = 2.8;
-
-uniform float fCoCFalloffMM <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "CoC Falloff (mm)";
-    ui_tooltip = "Controls the smooth falloff of the CoC-based focal mask in millimeters.";
-    ui_min = 0.01; ui_max = 50.0; ui_step = 0.01;
-> = 0.5;
-
-static const float COC_SENSOR_SIZE = 0.024;
-
-uniform bool bUseAutoFocus <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Use Auto-Focus Point";
-    ui_tooltip = "Sample depth at the Auto-Focus UV to set the focus distance automatically.";
-> = true;
-
-uniform float2 AutoFocusUV <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Auto-Focus UV";
-    ui_tooltip = "Normalized screen UV used for auto-focus sampling (0..1).";
-    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
-> = float2(0.5, 0.5);
-
-uniform bool bHardCenterExclude <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Hard Center Exclude";
-    ui_tooltip = "Always exclude pixels within the Hard Exclude radius around the Auto-Focus UV regardless of depth.";
-> = false;
-
-uniform float fHardExcludeRadius <
-    ui_category = COLORISOLATION_CATEGORY_DEPTH;
-    ui_label = "Hard Exclude Radius";
-    ui_tooltip = "Normalized radius (0..0.5) around Auto-Focus UV to hard-exclude from isolation.";
-    ui_min = 0.0; ui_max = 0.5;
-    ui_step = 0.001;
-> = 0.001;
-
-float SampleLinearDepth(float2 tc)
-{
-    return ReShade::GetLinearizedDepth(tc);
-}
-
-float SmoothDepth(float2 tc, int radius)
-{
-    if (radius <= 0 || !bDepthSmooth) return SampleLinearDepth(tc);
-    float2 px = 1.0 / ReShade::ScreenSize;
-    float sum = 0.0;
-    float wsum = 0.0;
-    float centerDepth = SampleLinearDepth(tc);
-    float3 centerColor = tex2D(ReShade::BackBuffer, tc).rgb;
-
-    for (int y = -radius; y <= radius; ++y)
-    {
-        for (int x = -radius; x <= radius; ++x)
-        {
-            float2 off = float2(x, y) * px;
-            float d = SampleLinearDepth(tc + off);
-
-            // spatial weight (simple gaussian-ish by distance)
-            float dist = length(float2(x, y));
-            float w = exp(-dist * 0.8);
-
-            // bilateral color weight to preserve edges
-            if (bDepthBilateral)
-            {
-                float3 c = tex2D(ReShade::BackBuffer, tc + off).rgb;
-                float cd = length(c - centerColor);
-                w *= exp(-cd * 10.0);
-            }
-
-            sum += d * w;
-            wsum += w;
-        }
-    }
-
-    return wsum > 0.0 ? sum / wsum : centerDepth;
-}
-
-float ComputeFocalMask(float linearDepth, float focusDistMeters)
-{
-    if (!bExcludeFocus) return 0.0;
-    float pixelDepthInM = linearDepth * 1000.0;
-    float focusDepthInM = focusDistMeters;
-    float safePixelDepthInM = pixelDepthInM + (pixelDepthInM == 0.0 ? 1e-6 : 0.0);
-    float cocInMM = (((FocalLength * FocalLength) / FNumber) / ((focusDepthInM / 1000.0) - FocalLength)) *
-                     (abs(pixelDepthInM - focusDepthInM) / safePixelDepthInM);
-    float cocNormalized = clamp(abs(cocInMM) * COC_SENSOR_SIZE, 0.0, 1.0);
-    float mask = saturate(1.0 - smoothstep(0.0, fCoCFalloffMM, abs(cocInMM)));
-    return mask;
-}
-
-float ComputeCenterMask(float2 texcoord)
-{
-    if (!bUseCenterMask || fCenterRadius <= 0.0) return 0.0;
-    float centerDist = distance(texcoord, float2(0.5, 0.5));
-    float m = saturate(1.0 - (centerDist / max(1e-5, fCenterRadius)));
-    return m;
-}
-
-float ComputeExcludeMask(float2 texcoord, float linearDepth)
-{
-    float focusDistMeters = fFocusDistance;
-    if (bUseAutoFocus)
-    {
-        float sampled = SmoothDepth(AutoFocusUV, max(0, iDepthSmoothRadius));
-        focusDistMeters = sampled * 1000.0;
-    }
-
-    float focal = ComputeFocalMask(linearDepth, focusDistMeters);
-    float center = ComputeCenterMask(texcoord);
-    float mask = max(focal, center);
-
-    if (bHardCenterExclude)
-    {
-        float d = distance(texcoord, AutoFocusUV);
-        if (d <= fHardExcludeRadius)
-            mask = 1.0;
-    }
-
-    return saturate(mask * fExcludeStrength);
-}
-
+// --- SETUP ---
 uniform bool SHOW_DEBUG_OVERLAY <
-    ui_label = "Show Overlay";
+    ui_label = "Show Curve Overlay";
     ui_category = COLORISOLATION_CATEGORY_SETUP;
 > = false;
-
-uniform bool ENABLE_CURVE2 <
-    ui_type = "radio";
-    ui_label = "Enable Curve 2";
-    ui_category = COLORISOLATION_CATEGORY_SETUP;
-> = false;
-
-uniform bool BOOL_UNUSED <
-    ui_type = "radio";
-    ui_label = "Left Values: Curve 1, Right Values: Curve 2";
-    ui_category = COLORISOLATION_CATEGORY_SETUP;
-> = true;
 
 uniform float3 CURVE_CENTER <
     ui_type = "drag";
@@ -346,8 +36,7 @@ uniform float3 CURVE_HEIGHT<
     ui_category = COLORISOLATION_CATEGORY_SETUP;
     ui_label = "Strength (Curve 1,2,3)";
     ui_tooltip = "Select the saturation of the isolated color for each curve";
-    ui_min = 0.0;
-    ui_max = 1.0;
+    ui_min = 0.0; ui_max = 1.0;
     ui_step = 0.005;
 > = float3(1.0, 1.0, 1.0);
 
@@ -355,10 +44,16 @@ uniform float3 CURVE_OVERLAP <
     ui_type = "drag";
     ui_category = COLORISOLATION_CATEGORY_SETUP;
     ui_label = "Overlap (Curve 1,2,3)";
-    ui_tooltip = "Select how much neighbouring colors to isolate for each curve";
+    ui_tooltip = "Controls the width of the isolation bell curve.";
     ui_min = 0.0; ui_max = 1.0;
     ui_step = 0.001;
 > = float3(0.5, 0.5, 0.5);
+
+uniform bool ENABLE_CURVE2 <
+    ui_type = "radio";
+    ui_label = "Enable Curve 2";
+    ui_category = COLORISOLATION_CATEGORY_SETUP;
+> = false;
 
 uniform bool ENABLE_CURVE3 <
     ui_type = "radio";
@@ -372,10 +67,183 @@ uniform bool CURVE_INVERT <
     ui_category = COLORISOLATION_CATEGORY_SETUP;
 > = false;
 
+// --- DEPTH MASKING ---
+
+uniform float fDepthStart <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Depth Start";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
+> = 0.0;
+
+uniform float fDepthGamma <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Depth Reading Gamma";
+    ui_type = "slider";
+    ui_min = 0.001; ui_max = 5.0; ui_step = 0.001;
+    ui_tooltip = "Controls the mid-tone distribution of the depth buffer.";
+> = 1.0;
+
+uniform float fDepthEnd <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Depth End";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
+> = 1.0; // Default to 1.0 so initially ALL depth is included (until user tweaks it)
+
+uniform float fDepthFalloff <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Depth Falloff";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
+> = 0.1;
+
+uniform int iDepthStartSteps <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Depth Start Steps";
+    ui_type = "slider";
+    ui_min = 1; ui_max = 10000;
+> = 1000;
+
+uniform int iDepthEndSteps <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Depth End Steps";
+    ui_type = "slider";
+    ui_min = 1; ui_max = 10000;
+> = 1000;
+
+uniform int iDepthFalloffSteps <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Depth Falloff Steps";
+    ui_type = "slider";
+    ui_min = 1; ui_max = 10000;
+> = 1000;
+
+uniform bool bDebugDepth <
+    ui_type = "checkbox";
+    ui_label = "Show Depth Buffer";
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_tooltip = "Displays the linearized depth buffer in grayscale.";
+> = false;
+
+uniform bool bDepthSmooth <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Enable Depth Smoothing";
+> = false; // Default OFF to preserve small pixels
+
+uniform int iDepthSmoothRadius <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Depth Smooth Radius";
+    ui_type = "slider";
+    ui_min = 0; ui_max = 4;
+> = 0;
+
+uniform bool bDepthBilateral <
+    ui_category = COLORISOLATION_CATEGORY_DEPTH;
+    ui_label = "Bilateral Smoothing";
+> = true;
+
+// --- FOREGROUND PROTECTION (EXCLUDE) ---
+
+uniform bool bExcludeFocus <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Exclude Focus Band";
+    ui_tooltip = "Excludes pixels within the Focus Range of the Focus Depth from isolation.";
+> = false;
+
+uniform bool bExcludeForeground <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Exclude Foreground";
+    ui_tooltip = "Protects everything closer than the focus depth (keeps it in color).";
+> = true;
+
+uniform bool bProtectSpecificColor <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Filter Protection by Color";
+    ui_tooltip = "If enabled, foreground objects will ONLY be protected if they match the color below.";
+> = false;
+
+uniform float3 fProtectionColor <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_type = "color";
+    ui_label = "Protection Target Color";
+> = float3(1.0, 0.8, 0.6);
+
+uniform float fProtectionColorRange <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_type = "slider";
+    ui_label = "Protection Color Range";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
+> = 0.2;
+
+uniform float fFocusDepth <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Focus Depth (0-1)";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
+> = 0.050;
+
+uniform float fFocusRangeDepth <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Focus Band Width (0-1)";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
+> = 0.020;
+
+uniform float fForegroundDepthOffset <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Protection Offset (0-1)";
+    ui_type = "slider";
+    ui_min = -0.1; ui_max = 0.1; ui_step = 0.0001;
+> = 0.005;
+
+uniform float fForegroundDepthFalloff <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Protection Falloff (0-1)";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 0.2; ui_step = 0.0001;
+> = 0.010;
+
+uniform int iForegroundSteps <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Protection Falloff Steps";
+    ui_type = "slider";
+    ui_min = 1; ui_max = 10000;
+> = 1000;
+
+uniform float fExcludeStrength <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Exclude Strength";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+> = 1.0;
+
+uniform bool bUseAutoFocus <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Use Auto-Focus Point";
+> = true;
+
+uniform float2 AutoFocusUV <
+    ui_category = COLORISOLATION_CATEGORY_EXCLUDE;
+    ui_label = "Auto-Focus UV";
+    ui_type = "slider";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+> = float2(0.5, 0.5);
+
+
+// --- DEBUG UI ---
+
 uniform bool SHOW_COLOR_DIFFERENCE <
     ui_type = "radio";
     ui_label = "Show Color Difference";
     ui_category = COLORISOLATION_CATEGORY_DEBUG;
+> = false;
+
+uniform bool SHOW_EXCLUDE_MASK <
+    ui_type = "radio";
+    ui_label = "Show Protection Mask";
+    ui_category = COLORISOLATION_CATEGORY_DEBUG;
+    ui_tooltip = "White = Protected (Full Color), Black = Isolated (Curves Apply)";
 > = false;
 
 uniform float2 DEBUG_OVERLAY_POSITION<
@@ -383,8 +251,7 @@ uniform float2 DEBUG_OVERLAY_POSITION<
     ui_category = COLORISOLATION_CATEGORY_DEBUG;
     ui_category_closed = true;
     ui_label = "Overlay Position";
-    ui_min = 0.0; ui_max = 1.0;
-    ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
 > = float2(0.0, 0.15);
 
 uniform int2 DEBUG_OVERLAY_SIZE <
@@ -392,9 +259,7 @@ uniform int2 DEBUG_OVERLAY_SIZE <
     ui_category = COLORISOLATION_CATEGORY_DEBUG;
     ui_category_closed = true;
     ui_label = "Overlay Size";
-    ui_tooltip = "x: width\nz: height";
-    ui_min = 50;
-    ui_step = 1;
+    ui_min = 50; ui_step = 1;
 > = int2(1000, 300);
 
 uniform float DEBUG_OVERLAY_OPACITY <
@@ -402,9 +267,10 @@ uniform float DEBUG_OVERLAY_OPACITY <
     ui_category = COLORISOLATION_CATEGORY_DEBUG;
     ui_category_closed = true;
     ui_label = "Overlay Opacity";
-    ui_min = 0.0; ui_max = 1.0;
-    ui_step = 0.01;
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
 > = 1.0;
+
+// --- FUNCTIONS ---
 
 float3 RGBfromHue(float3 c) {
     const float3 A = float3(120.0, 60.0, 180.0)/360.0;
@@ -433,22 +299,20 @@ float3 RGBtoHSV(float3 c) {
 // Pseudo-Voigt Curve
 float Curve(float x, float p, float s, float h) {
     float dist = x - p;
-    float sigma = max(0.001, s * 0.5); 
+    float sigma = max(0.001, s * 0.12); 
     float gaussian = exp(-0.5 * (dist * dist) / (sigma * sigma));
     float lorentzian = 1.0 / (1.0 + (dist * dist) / (sigma * sigma));
-    float mix_ratio = 0.5; 
+    float mix_ratio = 0.5;
     float value = lerp(gaussian, lorentzian, mix_ratio);
     return value * h;
 }
 
 float CalculateWeight(float x, float3 pos, float3 slope, float3 height) {
     float value = 0.0;
-    // curve 1
     value += Curve(x, pos.x, slope.x, height.x);
     value += Curve(x, pos.x + 1.0, slope.x, height.x);
     value += Curve(x, pos.x - 1.0, slope.x, height.x);
 
-    // curve 2 (optional)
     if (ENABLE_CURVE2)
     {
         value += Curve(x, pos.y, slope.y, height.y);
@@ -456,7 +320,6 @@ float CalculateWeight(float x, float3 pos, float3 slope, float3 height) {
         value += Curve(x, pos.y - 1.0, slope.y, height.y);
     }
 
-    // curve 3 (optional)
     if (ENABLE_CURVE3)
     {
         value += Curve(x, pos.z, slope.z, height.z);
@@ -466,6 +329,99 @@ float CalculateWeight(float x, float3 pos, float3 slope, float3 height) {
 
     value = saturate(value);
     return CURVE_INVERT ? 1.0 - value : value;
+}
+
+float SampleLinearDepth(float2 tc) {
+    return ReShade::GetLinearizedDepth(tc);
+}
+
+float SmoothDepth(float2 tc, int radius) {
+    if (radius <= 0 || !bDepthSmooth) return SampleLinearDepth(tc);
+    float2 px = 1.0 / ReShade::ScreenSize;
+    float sum = 0.0;
+    float wsum = 0.0;
+    float centerDepth = SampleLinearDepth(tc);
+    float3 centerColor = tex2D(ReShade::BackBuffer, tc).rgb;
+
+    for (int y = -radius; y <= radius; ++y)
+    {
+        for (int x = -radius; x <= radius; ++x)
+        {
+            float2 off = float2(x, y) * px;
+            float d = SampleLinearDepth(tc + off);
+            float dist = length(float2(x, y));
+            float w = exp(-dist * 0.8);
+
+            if (bDepthBilateral) {
+                float3 c = tex2D(ReShade::BackBuffer, tc + off).rgb;
+                float cd = length(c - centerColor);
+                w *= exp(-cd * 10.0);
+            }
+            sum += d * w;
+            wsum += w;
+        }
+    }
+    return wsum > 0.0 ? sum / wsum : centerDepth;
+}
+
+float Quantize(float v, int steps) {
+    int s = max(1, steps);
+    return round(v * (float)s) / (float)s;
+}
+
+float PreciseDepthMask(float depth, float start, float end, float falloff, int sSteps, int eSteps, int fSteps) {
+    float sQ = Quantize(start, sSteps);
+    float eQ = Quantize(end, eSteps);
+    float fQ = Quantize(falloff, fSteps);
+    if (eQ < sQ) eQ = sQ;
+    float mask = smoothstep(sQ, eQ, depth) * (1.0 - smoothstep(eQ, eQ + fQ, depth));
+    return saturate(mask);
+}
+
+// Updated Focal Mask
+float ComputeFocalMask(float linearDepth, float focusDepth) {
+    if (!bExcludeFocus) return 0.0;
+    float dist = abs(linearDepth - focusDepth);
+    float range = max(0.0001, fFocusRangeDepth);
+    float val = dist / range;
+    float mask = saturate(1.0 - val);
+    return smoothstep(0.0, 1.0, mask);
+}
+
+// Updated Foreground Mask
+float ComputeForegroundMask(float linearDepth, float focusDepth) {
+    if (!bExcludeForeground) return 0.0;
+    float protectionEnd = focusDepth + fForegroundDepthOffset;
+    float falloff = Quantize(fForegroundDepthFalloff, iForegroundSteps);
+    float mask = 1.0 - smoothstep(protectionEnd, protectionEnd + max(0.001, falloff), linearDepth);
+    return saturate(mask);
+}
+
+// Color Protection
+float ComputeColorProtection(float3 currColor) {
+    if (!bProtectSpecificColor) return 1.0; 
+    float diff = distance(currColor, fProtectionColor);
+    return 1.0 - smoothstep(fProtectionColorRange * 0.5, fProtectionColorRange, diff);
+}
+
+// Updated Exclude Mask
+float ComputeExcludeMask(float2 texcoord, float linearDepth, float3 currColor, float depthGamma) {
+    float focusDepth = fFocusDepth;
+    if (bUseAutoFocus) {
+        float sampled = SmoothDepth(AutoFocusUV, max(0, iDepthSmoothRadius));
+        focusDepth = sampled;
+        focusDepth = pow(max(0.0, focusDepth), depthGamma);
+    }
+
+    float focal = ComputeFocalMask(linearDepth, focusDepth);
+    float foreground = ComputeForegroundMask(linearDepth, focusDepth);
+    
+    float colorProtect = ComputeColorProtection(currColor);
+    foreground *= colorProtect;
+
+    float mask = max(focal, foreground);
+
+    return saturate(mask * fExcludeStrength);
 }
 
 float3 DrawDebugOverlay(float3 background, float3 param, float2 pos, int2 size, float opacity, int2 vpos, float2 texcoord) {
@@ -479,9 +435,15 @@ float3 DrawDebugOverlay(float3 background, float3 param, float2 pos, int2 size, 
         y = Map(texcoord.y, float2(overlayPos.y, overlayPos.y + size.y) / ReShade::ScreenSize.y, float2(0.0, 1.0));
         hsvStrip = RGBfromHue(float3(x, 1.0, 1.0));
         luma = dot(hsvStrip, float3(0.2126, 0.7151, 0.0721));
+        
         value = CalculateWeight(x, CURVE_CENTER, CURVE_OVERLAP, CURVE_HEIGHT);
+        
         overlay = lerp(luma.rrr, hsvStrip, value);
-        overlay = lerp(overlay, 0.0.rrr, exp(-size.y * length(float2(x, 1.0 - y) - float2(x, value))));
+        
+        float line_dist = abs((1.0 - y) - value);
+        float line_alpha = exp(-size.y * 0.02 * line_dist);
+        
+        overlay = lerp(overlay, 0.0.rrr, line_alpha);
         background = lerp(background, overlay, opacity);
     }
 
@@ -496,10 +458,8 @@ float3 ColorIsolationPS(float4 vpos : SV_Position, float2 texcoord : TexCoord) :
 
     if (bDebugDepth)
     {
-        float3 depth_vis = depth.xxx;
-        // Optionally visualize the Gamma correction in the debug view so you can see the curve
-        // float3 depth_vis = pow(depth, fDepthGamma).xxx; 
-        retVal = depth_vis;
+        float depth_vis = pow(max(0.0, smooth_depth), fDepthGamma);
+        retVal = depth_vis.xxx;
         if(SHOW_DEBUG_OVERLAY)
         {
             retVal = DrawDebugOverlay(retVal, 1.0, DEBUG_OVERLAY_POSITION, DEBUG_OVERLAY_SIZE, DEBUG_OVERLAY_OPACITY, vpos.xy, texcoord);
@@ -509,22 +469,28 @@ float3 ColorIsolationPS(float4 vpos : SV_Position, float2 texcoord : TexCoord) :
 
     float3 luma = dot(color, float3(0.2126, 0.7151, 0.0721)).rrr;
     float value = CalculateWeight(RGBtoHSV(color).x, CURVE_CENTER, CURVE_OVERLAP, CURVE_HEIGHT);
-    
-    // Apply Gamma Correction to the depth used for Isolation Mask
-    // This allows better "Reading" of the depth buffer (expanding mids).
-    // Note: We use max(0.0, ...) to ensure no negative numbers (safety).
-    float depth_for_isolation = pow(max(0.0, smooth_depth), fDepthGamma);
 
-    // Use the gamma-corrected depth for the mask calculation
+    // Depth logic
+    float depth_for_isolation = pow(max(0.0, smooth_depth), fDepthGamma);
     float depth_factor = PreciseDepthMask(depth_for_isolation, fDepthStart, fDepthEnd, fDepthFalloff, iDepthStartSteps, iDepthEndSteps, iDepthFalloffSteps);
     
-    // Use the physical linear depth for Focus/Exclude (to keep meter units accurate)
-    float excludeMask = ComputeExcludeMask(texcoord, smooth_depth);
+    // Exclude Logic (Protection)
+    float excludeMask = ComputeExcludeMask(texcoord, depth_for_isolation, color, fDepthGamma);
+
+    // LOGIC FIX:
+    // depth_factor = 1.0 (Inside Zone) -> Use Curve Value.
+    // depth_factor = 0.0 (Outside Zone) -> Force 0.0 (Grey).
+    float isolation_weight = value * depth_factor;
     
-    float combinedExclude = excludeMask;
-    float combinedDepthMask = lerp(depth_factor, 1.0, combinedExclude);
-    float final_weight = lerp(1.0, value, combinedDepthMask);
+    // Protection overrides everything to 1.0 (Color).
+    float final_weight = max(isolation_weight, excludeMask);
+
     retVal = lerp(luma, color, final_weight);
+    
+    if(SHOW_EXCLUDE_MASK)
+    {
+        retVal = float3(excludeMask, excludeMask, excludeMask);
+    }
     
     if(SHOW_COLOR_DIFFERENCE)
     {
